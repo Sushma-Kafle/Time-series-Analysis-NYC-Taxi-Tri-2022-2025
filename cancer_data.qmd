@@ -1,0 +1,133 @@
+---
+title: "Group_Project"
+format: html
+editor: visual
+---
+
+```{r}
+#| message: false
+library(tsibble)
+library(tidyverse)
+library(fpp3)
+library(slider) #for rolling window functions
+library(gt)
+library(tsibbledata)
+library(ggplot2)
+library(feasts)
+library(dplyr)
+library(janitor) 
+library(GGally)
+```
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+#get input data
+cancer_data <- read.csv("/Users/sushmakafle/Documents/Master/ADS_506/Group_Project/global_cancer_patients_2015_2024.csv") 
+  
+
+```
+
+Lets do basic inspection of dataset
+
+```{r}
+glimpse(cancer_data)
+head(cancer_data)
+tail(cancer_data)
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+# Clean column names (optional but helpful)
+cancer_data <- cancer_data |> clean_names()
+```
+
+```{r}
+#Check for missing values
+colSums(is.na(cancer_data))
+```
+
+```{r}
+# Summary statistics
+summary(cancer_data)
+skim_without_charts(cancer_data)
+```
+
+```{r}
+#Unique values and counts for categorical columns
+cancer_data |>
+  summarise(across(where(is.character), n_distinct))
+
+
+```
+
+```{r}
+#Distribution of numeric variables
+cancer_data |>
+  select(where(is.numeric)) |>
+  gather(key = "variable", value = "value") |>
+  ggplot(aes(x = value, fill = variable)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Numeric Variables")
+```
+
+```{r}
+cancer_summary <- cancer_data |>
+```
+
+```{group_by(year) |>}
+  summarise(total_patients = n_distinct(patient_id), .groups = "drop")
+```
+
+```{r}
+print(cancer_summary)
+
+```
+
+```{r}
+# Plot trend
+ggplot(cancer_summary, aes(x = year, y = total_patients)) +
+  geom_line(linewidth = 1, color = "steelblue") +
+  geom_point(color = "darkred") +
+  theme_minimal() +
+  labs(title = "Total Unique Cancer Patients by Year",
+       x = "Year", y = "Number of Patients")
+```
+
+```{r}
+# Patients by region/country (top 10)
+if("country" %in% names(cancer_data)) {
+  cancer_data |>
+    group_by(country) |>
+    summarise(total_patients = sum(patients, na.rm = TRUE)) %>%
+    arrange(desc(total_patients)) |>
+    slice_head(n = 10) |>
+    ggplot(aes(x = reorder(country, total_patients), y = total_patients)) +
+    geom_col(fill = "tomato") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top 10 Countries by Total Cancer Patients",
+         x = "Country", y = "Total Patients")
+}
+
+```
+
+```{r}
+# Correlation heatmap for numeric variables
+library(GGally)
+cancer_data |>
+  select(where(is.numeric)) |>
+  ggcorr(label = TRUE)
+
+```
+
+# 
