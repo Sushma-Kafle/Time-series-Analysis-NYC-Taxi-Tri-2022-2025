@@ -1,0 +1,166 @@
+---
+title: "Trip_Record"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+install.packages("arrow")
+
+install.packages(c("arrow", "dplyr"))
+
+```
+
+You can add options to executable code like this
+
+```{r}
+library(arrow)
+library(dplyr)
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+#get input data
+#trip_data <- read_parquet("/Users/sushmakafle/Documents/Master/ADS_506/Group_Project#/yellow_tripdata_2022-01.parquet")
+
+```
+
+```{r}
+library(purrr)
+
+years <- 2022:2024
+months <- sprintf("%02d", 1:12)
+
+urls <- expand.grid(year = years, month = months) |>
+  mutate(
+    url = paste0(
+      "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_",
+      year, "-", month, ".parquet"
+    )
+  ) |>
+  pull(url)
+
+# Read the first few months only to test (adjust as needed)
+taxi_data <- map_dfr(urls[1:3], ~{
+  tryCatch({
+    read_parquet(.x)
+  }, error = function(e) {
+    message("Skipping: ", .x)
+    NULL
+  })
+})
+```
+
+Lets do basic inspection of dataset
+
+```{r}
+head(taxi_data,3)
+glimpse(taxi_data)
+head(taxi_data)
+tail(taxi_data)
+```
+
+```{r}
+taxi_filtered <- taxi_data |>
+  filter(tpep_pickup_datetime >= as.POSIXct("2022-01-01"))
+
+```
+
+```{r}
+names(taxi_data)
+
+```
+
+```{r}
+library(dplyr)
+
+taxi_data <- taxi_data %>%
+  select(-Airport_fee) # to remove "Airport_fee" bacause its dupe column
+
+```
+
+```{r}
+names(taxi_data)
+```
+
+```{r}
+#Check for missing values
+colSums(is.na(taxi_data))
+```
+
+```{r}
+#| message: false
+library(tsibble)
+library(tidyverse)
+library(fpp3)
+library(slider) #for rolling window functions
+library(gt)
+library(tsibbledata)
+library(ggplot2)
+library(feasts)
+library(dplyr)
+library(janitor) 
+library(GGally)
+```
+
+```{r}
+# Summary statistics
+summary(taxi_data)
+skim_without_charts(taxi_data)
+```
+
+```{r}
+#Unique values and counts for categorical columns
+taxi_data |>
+  summarise(across(where(is.character), n_distinct))
+
+
+```
+
+```{r}
+#Distribution of numeric variables
+
+```
+
+```{r}
+# Plot trend
+
+```
+
+```{r}
+# Patients by region/country (top 10)
+if("country" %in% names(taxi_data)) {
+  taxi_data |>
+    group_by(country) |>
+    summarise(total_patients = sum(patients, na.rm = TRUE)) %>%
+    arrange(desc(total_patients)) |>
+    slice_head(n = 10) |>
+    ggplot(aes(x = reorder(country, total_patients), y = total_patients)) +
+    geom_col(fill = "tomato") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Top 10 Countries by Total Cancer Patients",
+         x = "Country", y = "Total Patients")
+}
+
+```
+
+```{r}
+# Correlation heatmap for numeric variables
+library(GGally)
+taxi_data |>
+  select(where(is.numeric)) |>
+  ggcorr(label = TRUE)
+
+```
+
+# 
