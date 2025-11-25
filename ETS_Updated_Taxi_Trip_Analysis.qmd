@@ -1,0 +1,253 @@
+---
+title: "ETS_Updated_Taxi_Trip_Analysis"
+format: html
+editor: visual
+---
+
+# **Introduction of the analysis**
+
+This report analyzes New York City Yellow Taxi trip records from 2022–2025 using daily aggregated data. The raw TLC files are provided as monthly parquet files, which are first combined and collapsed to daily trip counts. The goals of the analysis are: - to describe overall trends in daily taxi usage, - to explore weekly and yearly seasonality, and - to build an automatic ARIMA model to forecast future daily demand.
+
+## Setup
+
+The following packages are used throughout the analysis.
+
+```{r}
+library(fpp3)  # loads tsibble, fable, feasts, dplyr, ggplot2, etc.
+library(arrow) # for read_parquet()
+library(lubridate) # for date helpers (if needed explicitly)
+library(purrr)  # for map_dfr()
+library(tidyverse) # core data science packages (dplyr,tidyr,ggplot2,tibble,stringr,forcats)
+library(gt)  # for creating clean, publication-quality tables
+library(urca)
+
+
+```
+
+```{r}
+
+```
+
+## Data loading and daily aggregation
+
+The raw TLC Yellow Taxi trip data are stored as monthly parquet files in a local folder.\
+To keep the analysis memory-efficient, each file is read one at a time, and trips are aggregated to the daily level inside a loop.\
+The resulting `daily_data` table contains one row per calendar date with the total number of trips.
+
+```{r}
+#| echo: false
+data_folder <- "C:/Users/patel/OneDrive/Documents/R projects/ADS506_TaxiData"
+
+files <- list.files(
+  path = data_folder,pattern = "*.parquet",full.names = TRUE)
+
+daily_list <- list()
+
+for (i in seq_along(files)) {
+  cat("Processing:", files[i], "\n")
+  
+  df <- read_parquet(files[i], col_select = "tpep_pickup_datetime")
+  
+  daily <- df |>
+    mutate(date = as.Date(tpep_pickup_datetime)) |>
+    count(date, name = "trips")
+  
+  daily_list[[i]] <- daily
+  rm(df); gc()}
+
+# Combine all daily results
+daily_data <- bind_rows(daily_list) |>
+  group_by(date) |>
+  summarise(trips = sum(trips), .groups = "drop")
+```
+
+## Initial checks and summary statistics
+
+Before moving to modeling, it is useful to inspect the size of the daily dataset and obtain basic summary statistics for the number of trips per day.
+
+```{r}
+nrow(daily_data)
+```
+
+```{r}
+# Summary statistics
+summary(daily_data)
+```
+
+We also enrich the data set with calendar fields (year, month, weekday), which will be useful for later seasonality plots.
+
+```{r}
+# arrange the date
+daily_data <- daily_data |>
+  mutate(
+    date = as.Date(date),
+    year = year(date),
+    month = month(date, label = TRUE, abbr = TRUE),
+    wday  = wday(date, label = TRUE, abbr = TRUE)
+  ) |>
+  arrange(date)
+
+summary(daily_data$date)
+min(daily_data$date)
+max(daily_data$date)
+
+```
+
+To remove clearly erroneous dates (e.g., early 2000s or future dates), the analysis is restricted to the 2022–2025 window.
+
+```{r}
+daily_data <- daily_data |>
+  mutate(date = as.Date(date)) |>
+  filter(
+    date >= as.Date("2022-01-01"),
+    date <= as.Date("2025-12-31")   # or Sys.Date()
+  ) |>
+  arrange(date) 
+```
+
+## **Summary table (gt)**
+
+```{r}
+daily_data |>
+  summarise(
+    min_date = min(date),
+    max_date = max(date),
+    mean_trips = mean(trips),
+    median_trips = median(trips),
+    sd_trips = sd(trips),
+    n_days = n()
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Summary of Daily Yellow Taxi Trips (2022–2025)"
+  )
+```
+
+## **Overall trend and key metrics**
+
+To explore recurring patterns, we examine how average trip counts vary by day of week and by month of year.\
+These plots highlight weekly seasonality (weekday vs weekend patterns) and broader annual seasonality.
+
+```{r}
+daily_data %>%
+  summarise(
+    avg_daily_trips = mean(trips),
+    max_daily_trips = max(trips),
+    min_daily_trips = min(trips)
+  ) %>%
+  gt() %>%
+  tab_header(title = "Key Metrics")
+```
+
+The next figure shows the full time-series of daily Yellow Taxi trips over the 2022–2025 period.
+
+```{r}
+ggplot(daily_data, aes(x = date, y = trips)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "Daily Yellow Taxi Trips (2022–2025)",
+    x = "Date",
+    y = "Trips")
+```
+
+```{r}
+#Create a tsibble (needed for seasonality + forecasting)
+daily_ts <- daily_data |>
+  as_tsibble(index = date)
+```
+
+It is also useful to check whether there are any missing days in the series:
+
+```{r}
+daily_ts |> count_gaps() #Check for gap
+```
+
+```{r}
+ggplot(daily_data, aes(x = month, y = trips)) +
+  stat_summary(fun = "mean",geom = "point") +
+  labs(title = "Average Trips by Month", x = "Month", y = "Average Trips")
+```
+
+```{r}
+library(feasts)
+#STL decomposition (find seasonality automatically)
+daily_ts |>
+  model(STL(trips)) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition of Daily Yellow Taxi Trips")
+
+```
+
+## **Train–test split and auto ARIMA modeling**
+
+To evaluate forecasting performance, the data are split into a training set and a hold-out test set. Here, the training set includes observations up to the end of 2024, and the remaining days are used for out-of-sample evaluation.
+
+```{r}
+train_taxi <- daily_ts |> filter(date <= as.Date("2024-12-31"))
+test_taxi  <- daily_ts |> filter(date >  as.Date("2024-12-31"))
+```
+
+An automatic ARIMA model is then fitted to the training data. The ARIMA specification (orders of differencing and AR/MA terms) is selected automatically based on information criteria. Using the fitted ARIMA model, we generate a 180-day forecast with 80% and 95% prediction intervals. The forecast is plotted along with the historical data to visually assess its behavior.
+
+```{r}
+# assume daily_data has columns: date, trips
+fit <- train_taxi |>
+  model(arima = ARIMA(trips))
+fc <- fit |> forecast(h = "180 days", level = c(80, 95))
+```
+
+To summarize forecast performance, we compute accuracy metrics on the hold-out test set, focusing on ME, RMSE, MAE, MAPE, MPE, and the first-order autocorrelation of residuals (ACF1).
+
+```{r}
+autoplot(fc, daily_ts) +labs(title = "Forecast of Daily Yellow Taxi Trips",x = "Date",y = "Number of Trips" )
+
+acc_tbl <- accuracy(fc, test_taxi,measures = list(ME = ME, RMSE = RMSE, MAE = MAE, MAPE = MAPE, MPE = MPE, ACF1 = ACF1))
+  acc_tbl|>
+  gt() |>
+  tab_header(title = "Model Accuracy on Test Set") |>
+  fmt_number(columns = where(is.numeric),decimals = 2)
+
+report(fit)
+
+```
+
+## **Seasonal plot**
+
+As an additional diagnostic, a seasonal plot is used to visualize how the daily pattern evolves over the course of the year and how it compares across years.
+
+```{r}
+library(feasts)
+library(ggplot2)
+#Confirm seasonality in a nicer way (optional)
+daily_ts |> 
+  gg_season(trips) +
+  labs(title = "Seasonal Plot of Daily Taxi Trips")
+```
+
+```{r}
+nrow(daily_data)
+
+head(daily_data,10)
+```
+
+```{r}
+ets_fit <- train_taxi |>
+  model(ets = ETS(trips))
+fc_ets <- ets_fit |> forecast(h = "180 days", level = c(80, 95))
+```
+
+```{r}
+recent_dates <- daily_ts %>% 
+  filter(date >= as.Date("2024-10-01"))
+
+autoplot(fc_ets, recent_dates) +labs(title = "ETS Forecast of Daily Yellow Taxi Trips",x = "Date",y = "Number of Trips" )
+
+ets_acc_tbl <- accuracy(fc_ets, test_taxi,measures = list(ME = ME, RMSE = RMSE, MAE = MAE, MAPE = MAPE, MPE = MPE, ACF1 = ACF1))
+  ets_acc_tbl|>
+  gt() |>
+  tab_header(title = "Model Accuracy on Test Set") |>
+  fmt_number(columns = where(is.numeric),decimals = 2)
+
+report(ets_fit)
+```
