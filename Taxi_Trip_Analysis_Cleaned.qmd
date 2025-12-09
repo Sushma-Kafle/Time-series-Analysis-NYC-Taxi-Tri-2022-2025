@@ -1,0 +1,404 @@
+---
+title: "Updated_Taxi_Trip_Analysis"
+format: pdf
+editor: visual
+---
+
+# **Introduction of the analysis**
+
+This report analyzes New York City Yellow Taxi trip records from 2022–2025 using daily aggregated data. The raw TLC files are provided as monthly parquet files, which are first combined and collapsed to daily trip counts. The goals of the analysis are: - to describe overall trends in daily taxi usage, - to explore weekly and yearly seasonality, and - to build an automatic ARIMA model to forecast future daily demand.
+
+## Setup
+
+The following packages are used throughout the analysis.
+
+```{r}
+library(fpp3)
+library(arrow) 
+library(lubridate) 
+library(purrr) 
+library(tidyverse) 
+library(gt)  
+```
+
+## Data loading and daily aggregation
+
+The raw TLC Yellow Taxi trip data are stored as monthly parquet files in a local folder.\
+To keep the analysis memory-efficient, each file is read one at a time, and trips are aggregated to the daily level inside a loop.\
+The resulting `daily_data` table contains one row per calendar date with the total number of trips.
+
+```{r}
+#| echo: false
+#| messages:  FALSE
+#| include: FALSE
+
+
+data_folder <- "~/Downloads/ADS506B Module 7/NYC Taxi Data"
+
+
+files <- list.files(
+  path = data_folder,pattern = "*.parquet",full.names = TRUE)
+
+airport_ids <- c(1, 132, 138)
+
+daily_list <- list()
+
+for (i in seq_along(files)) {
+  cat("Processing:", files[i], "\n")
+  
+  # Read all needed columns once
+  df <- read_parquet(
+    files[i],
+    col_select = c("tpep_pickup_datetime", "PULocationID", "DOLocationID")
+  )
+  
+  daily <- df |>
+    mutate(
+      date = as.Date(tpep_pickup_datetime),
+      airport_trip = PULocationID %in% airport_ids | DOLocationID %in% airport_ids
+    ) |>
+    group_by(date) |>
+    summarise(
+      trips              = n(),
+      airport_trips      = sum(airport_trip),
+      non_airport_trips  = n() - sum(airport_trip),
+      .groups = "drop"
+    )
+  
+  daily_list[[i]] <- daily
+  rm(df); gc()
+}
+
+# Combine all daily results across months
+daily_data <- bind_rows(daily_list) |>
+  group_by(date) |>
+  summarise(
+    trips             = sum(trips),
+    airport_trips     = sum(airport_trips),
+    non_airport_trips = sum(non_airport_trips),
+    .groups = "drop"
+  )
+
+
+```
+
+## Initial checks and summary statistics
+
+Before moving to modeling, it is useful to inspect the size of the daily dataset and obtain basic summary statistics for the number of trips per day.
+
+```{r}
+nrow(daily_data)
+```
+
+```{r}
+# Summary statistics
+summary(daily_data)
+```
+
+We also enrich the data set with calendar fields (year, month, weekday), which will be useful for later seasonality plots.
+
+```{r}
+# arrange the date
+daily_data <- daily_data |>
+  mutate(
+    date = as.Date(date),
+    year = year(date),
+    month = month(date, label = TRUE, abbr = TRUE),
+    wday  = wday(date, label = TRUE, abbr = TRUE)
+  ) |>
+  arrange(date)
+
+summary(daily_data$date)
+min(daily_data$date)
+max(daily_data$date)
+
+```
+
+To remove clearly erroneous dates (e.g., early 2000s or future dates), the analysis is restricted to the 2022–2025 window.
+
+```{r}
+daily_data <- daily_data |>
+  mutate(date = as.Date(date)) |>
+  filter(
+    date >= as.Date("2022-01-01"),
+    date <= as.Date("2025-12-31")   
+  ) |>
+  arrange(date) 
+```
+
+## **Summary table (gt)**
+
+```{r}
+daily_data |>
+  summarise(
+    min_date = min(date),
+    max_date = max(date),
+    mean_trips = mean(trips),
+    median_trips = median(trips),
+    sd_trips = sd(trips),
+    n_days = n()
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Summary of Daily Yellow Taxi Trips (2022–2025)"
+  )
+```
+
+## **Overall trend and key metrics**
+
+To explore recurring patterns, we examine how average trip counts vary by day of week and by month of year.\
+These plots highlight weekly seasonality (weekday vs weekend patterns) and broader annual seasonality.
+
+```{r}
+daily_data %>%
+  summarise(
+    avg_daily_trips = mean(trips),
+    max_daily_trips = max(trips),
+    min_daily_trips = min(trips)
+  ) %>%
+  gt() %>%
+  tab_header(title = "Key Metrics")
+```
+
+The next figure shows the full time-series of daily Yellow Taxi trips over the 2022–2025 period.
+
+```{r}
+ggplot(daily_data, aes(x = date, y = trips)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "Daily Yellow Taxi Trips (2022–2025)",
+    x = "Date",
+    y = "Trips")
+```
+
+```{r}
+#Create a tsibble (needed for seasonality + forecasting)
+daily_ts <- daily_data |>
+  as_tsibble(index = date)
+```
+
+It is also useful to check whether there are any missing days in the series:
+
+```{r}
+daily_ts |> count_gaps() #Check for gap
+```
+
+```{r}
+ggplot(daily_data, aes(x = month, y = trips)) +
+  stat_summary(fun = "mean",geom = "point") +
+  labs(title = "Average Trips by Month", x = "Month", y = "Average Trips")
+```
+
+## **Train–test split and auto ARIMA modeling**
+
+To evaluate forecasting performance, the data are split into a training set and a hold-out test set. Here, the training set includes observations up to the end of 2024, and the remaining days are used for out-of-sample evaluation.
+
+```{r}
+train_taxi <- daily_ts |> filter(date <= as.Date("2024-12-31"))
+test_taxi  <- daily_ts |> filter(date >  as.Date("2024-12-31"))
+```
+
+Now lets fit automatic ARIMA model , TSLM and ETS along with baseline Naive model into the training data.
+
+```{r}
+# Fit all models on the training data
+fit_taxi <- train_taxi |>
+  model(
+    NAIVE = NAIVE(trips),                       # baseline
+    ARIMA = ARIMA(trips),                       # automatic ARIMA
+    ETS   = ETS(trips),                         # exponential smoothing
+    TSLM  = TSLM(trips ~ trend() + season())    # time series linear model
+  )
+
+fit_taxi
+
+```
+
+```{r}
+acc_train <- fit_taxi |>
+  augment() |>
+  as_tibble() |>          # drop tsibble grouping
+  group_by(.model) |>
+  summarise(
+    RMSE = sqrt(mean(.resid^2, na.rm = TRUE)),
+    MAE  = mean(abs(.resid), na.rm = TRUE),
+    MAPE = mean(abs(.resid / trips), na.rm = TRUE) * 100
+  ) |>
+  arrange(RMSE) |>
+  gt()
+
+acc_train
+```
+
+```{r}
+best_model_name <- acc_train |>
+  slice_min(RMSE, n = 1) |>
+  pull(.model)
+
+best_model_name   # to see which one performed best
+
+best_fit <- fit_taxi |> select(all_of(best_model_name))
+```
+
+```{r}
+## Multi-seasonal TSLM: weekly (wday) + annual (month) 
+
+# Build a tsibble with factor versions of month and weekday
+daily_ts_multi <- daily_ts |>
+  mutate(
+    month_f = factor(month),   # month factor (annual pattern)
+    wday_f  = factor(wday)     # weekday factor (weekly pattern)
+  )
+
+train_taxi_multi <- daily_ts_multi |>
+  filter(date <= as.Date("2024-12-31"))
+
+test_taxi_multi <- daily_ts_multi |>
+  filter(date >  as.Date("2024-12-31"))
+
+# Fit a TSLM with both month-of-year and day-of-week seasonality
+fit_multi <- train_taxi_multi |>
+  model(
+    TSLM_multi = TSLM(trips ~ trend() + month_f + wday_f)
+  )
+
+report(fit_multi)
+
+# Training accuracy for the multi-seasonal model
+acc_multi_train <- fit_multi |>
+  augment() |>
+  as_tibble() |>
+  group_by(.model) |>
+  summarise(
+    RMSE = sqrt(mean(.resid^2, na.rm = TRUE)),
+    MAE  = mean(abs(.resid), na.rm = TRUE),
+    MAPE = mean(abs(.resid / trips), na.rm = TRUE) * 100
+  ) |>
+  gt()
+
+acc_multi_train
+
+# Compare all models including the new multi-seasonal TSLM
+acc_all <- bind_rows(
+  acc_train,        
+  acc_multi_train   # new multi-seasonal model
+) |>
+  arrange(RMSE) 
+
+acc_all
+
+```
+
+```{r}
+## Forecast from multi-seasonal TSLM
+
+# Create future dates and their month/weekday factors
+future_multi <- new_data(train_taxi_multi, h = "180 days") |>
+  mutate(
+    month_f = factor(
+      month(date, label = TRUE, abbr = TRUE),
+      levels = levels(train_taxi_multi$month_f)
+    ),
+    wday_f = factor(
+      wday(date, label = TRUE, abbr = TRUE),
+      levels = levels(train_taxi_multi$wday_f)
+    )
+  )
+
+fc_multi <- forecast(fit_multi, new_data = future_multi)
+
+autoplot(fc_multi, train_taxi_multi) +
+  labs(
+    title = "180-Day Forecast – Multi-Seasonal TSLM (Month + Weekday)",
+    x = "Date",
+    y = "Daily Trips"
+  )
+
+```
+
+```{r}
+fc_best <- best_fit |>
+  forecast(h = "180 days", level = c(80, 95))
+
+fc_best |>
+  autoplot(train_taxi) +
+  labs(
+    title = paste0("180-Day Forecast of Daily Taxi Trips — Best Model: ", best_model_name),
+    x = "Date",
+    y = "Daily Trips"
+  )
+
+```
+
+AIRPORT VS NON-AIRPORT RIDES; COMPARISON
+
+Plot airport vs non-airport demand
+
+```{r}
+library(ggplot2)
+
+ggplot(daily_data, aes(x = date)) +
+  geom_line(aes(y = airport_trips, color = "Airport Trips")) +
+  geom_line(aes(y = non_airport_trips, color = "Non-Airport Trips")) +
+  labs(
+    title = "Daily Airport vs Non-Airport Taxi Trips",
+    x = "Date",
+    y = "Trips",
+    color = "Trip Type"
+  ) +
+  scale_color_manual(values = c("Airport Trips" = "red", "Non-Airport Trips" = "blue"))
+
+
+```
+
+Compare ETS models for airport vs non-airport trips
+
+```{r}
+## Compare ETS models for airport vs non-airport trips
+
+# Build training tsibbles directly from daily_data
+train_air <- daily_data |>
+  filter(date <= as.Date("2024-12-31")) |>
+  select(date, airport_trips) |>
+  as_tsibble(index = date)
+
+train_non <- daily_data |>
+  filter(date <= as.Date("2024-12-31")) |>
+  select(date, non_airport_trips) |>
+  as_tsibble(index = date)
+
+# Fit ETS model for airport trips
+fit_air <- train_air |>
+  model(ETS_airport = ETS(airport_trips))
+
+# Fit ETS model for non-airport trips
+fit_non <- train_non |>
+  model(ETS_non_airport = ETS(non_airport_trips))
+
+report(fit_air)
+report(fit_non)
+
+```
+
+Forecast both categories
+
+```{r}
+## Forecast both categories 
+
+fc_air <- fit_air |> forecast(h = "180 days")
+fc_non <- fit_non |> forecast(h = "180 days")
+
+autoplot(fc_air, train_air) +
+  labs(
+    title = "180-Day Forecast: Airport Trips",
+    x = "Date",
+    y = "Daily Airport Trips"
+  )
+
+autoplot(fc_non, train_non) +
+  labs(
+    title = "180-Day Forecast: Non-Airport Trips",
+    x = "Date",
+    y = "Daily Non-Airport Trips"
+  )
+```
